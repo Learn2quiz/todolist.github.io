@@ -115,24 +115,47 @@
 <body class="bg-slate-100 overflow-x-hidden">
     <div id="root"></div>
 
-    <!-- Firebase & React Logic -->
-    <!-- 수정된 부분: type="text/babel" data-type="module" 로 변경하여 JSX와 import 구문을 동시에 지원하도록 함 -->
-    <script type="text/babel" data-type="module">
+    <!-- 1. Firebase 설정 및 초기화 (모듈 스크립트로 분리) -->
+    <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { getFirestore, collection, addDoc, onSnapshot, doc, updateDoc, deleteDoc, increment, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
-        // Firebase Configuration
-        // 전역 변수가 정의되지 않았을 경우를 대비한 안전 장치 추가
+        // Firebase 설정
         const firebaseConfigRaw = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
         const firebaseConfig = JSON.parse(firebaseConfigRaw);
-        
+        const appIdRaw = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
         const db = getFirestore(app);
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 
-        // React Logic
+        // React 코드에서 사용할 수 있도록 window 객체에 할당 (브릿지 역할)
+        window.fb = {
+            auth,
+            db,
+            appId: appIdRaw,
+            initialAuthToken,
+            signInAnonymously,
+            signInWithCustomToken,
+            onAuthStateChanged,
+            collection,
+            addDoc,
+            onSnapshot,
+            doc,
+            updateDoc,
+            deleteDoc,
+            increment,
+            serverTimestamp
+        };
+        
+        // 로딩 완료 이벤트 발생 (React가 기다릴 수 있도록)
+        window.dispatchEvent(new Event('firebase-ready'));
+    </script>
+
+    <!-- 2. React 앱 로직 (Babel로 컴파일) -->
+    <script type="text/babel">
         const { useState, useEffect } = React;
 
         // --- 아이콘 컴포넌트 ---
@@ -243,26 +266,46 @@
             const [inputValues, setInputValues] = useState({});
             const [editingId, setEditingId] = useState(null);
             const [editText, setEditText] = useState('');
+            const [isFirebaseReady, setIsFirebaseReady] = useState(false);
 
-            // 1. Firebase Auth 초기화
+            // Firebase 준비 확인 및 초기화
             useEffect(() => {
-                const initAuth = async () => {
-                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-                        await signInWithCustomToken(auth, __initial_auth_token);
-                    } else {
-                        await signInAnonymously(auth);
+                const checkFirebase = () => {
+                    if (window.fb) {
+                        setIsFirebaseReady(true);
+                        initAuth();
                     }
                 };
-                initAuth();
-                const unsubscribe = onAuthStateChanged(auth, setUser);
-                return () => unsubscribe();
+
+                // 이미 로드되었으면 바로 실행
+                if (window.fb) {
+                    setIsFirebaseReady(true);
+                    initAuth();
+                } else {
+                    // 로드 대기
+                    window.addEventListener('firebase-ready', checkFirebase);
+                }
+
+                return () => window.removeEventListener('firebase-ready', checkFirebase);
             }, []);
 
-            // 2. Firestore 실시간 동기화
-            useEffect(() => {
-                if (!user) return;
+            const initAuth = async () => {
+                const { auth, signInWithCustomToken, signInAnonymously, initialAuthToken, onAuthStateChanged } = window.fb;
+                
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
 
-                // 공용 컬렉션에서 데이터 가져오기
+                onAuthStateChanged(auth, setUser);
+            };
+
+            // Firestore 데이터 동기화
+            useEffect(() => {
+                if (!user || !isFirebaseReady) return;
+
+                const { db, collection, onSnapshot, appId } = window.fb;
                 const q = collection(db, 'artifacts', appId, 'public', 'data', 'todos');
                 
                 const unsubscribe = onSnapshot(q, (snapshot) => {
@@ -271,11 +314,11 @@
                         ...doc.data()
                     }));
                     
-                    // 최신순 정렬 (Client-side Sorting)
+                    // 최신순 정렬
                     loadedTodos.sort((a, b) => {
                         const timeA = a.createdAt?.seconds || 0;
                         const timeB = b.createdAt?.seconds || 0;
-                        return timeB - timeA; // 내림차순 (최신이 위로)
+                        return timeB - timeA;
                     });
 
                     setTodos(loadedTodos);
@@ -284,13 +327,15 @@
                 });
 
                 return () => unsubscribe();
-            }, [user]);
+            }, [user, isFirebaseReady]);
 
-            // To-Do 추가 핸들러
+            // CRUD 동작들
             const handleAddTodo = async (categoryId) => {
                 const text = inputValues[categoryId];
                 if (!text || text.trim() === '') return;
-                if (!user) return;
+                if (!user || !isFirebaseReady) return;
+
+                const { db, collection, addDoc, serverTimestamp, appId } = window.fb;
 
                 try {
                     await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'todos'), {
@@ -319,7 +364,8 @@
             };
 
             const handleVote = async (id) => {
-                if (!user) return;
+                if (!user || !isFirebaseReady) return;
+                const { db, doc, updateDoc, increment, appId } = window.fb;
                 const todoRef = doc(db, 'artifacts', appId, 'public', 'data', 'todos', id);
                 try {
                     await updateDoc(todoRef, {
@@ -331,9 +377,10 @@
             };
 
             const handleDelete = async (id) => {
-                if (!user) return;
+                if (!user || !isFirebaseReady) return;
                 if (!confirm("정말 삭제하시겠습니까?")) return;
                 
+                const { db, doc, deleteDoc, appId } = window.fb;
                 const todoRef = doc(db, 'artifacts', appId, 'public', 'data', 'todos', id);
                 try {
                     await deleteDoc(todoRef);
@@ -343,7 +390,8 @@
             };
 
             const saveEdit = async (id) => {
-                if (!user) return;
+                if (!user || !isFirebaseReady) return;
+                const { db, doc, updateDoc, appId } = window.fb;
                 const todoRef = doc(db, 'artifacts', appId, 'public', 'data', 'todos', id);
                 try {
                     await updateDoc(todoRef, {
@@ -423,6 +471,15 @@
                     )}
                 </div>
             );
+
+            // 로딩 중이거나 준비되지 않았을 때
+            if (!isFirebaseReady) {
+                return (
+                    <div className="min-h-screen flex items-center justify-center bg-slate-100">
+                        <div className="animate-pulse text-slate-400 font-bold">Loading...</div>
+                    </div>
+                );
+            }
 
             return (
                 <div className="min-h-screen pb-10 overflow-x-hidden relative selection:bg-pink-300 selection:text-white">
